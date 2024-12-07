@@ -1,0 +1,259 @@
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+# library(ggThemeAssist)
+library(gridExtra)
+library(gbm)
+library(pROC)
+heart.data <- read_csv("heart_attack_prediction_dataset.csv")
+```
+Before performing any analysis, I did a simple tidying on the data, including rename, factorizing indicator variables, and deal with special format variable(blood pressure). Luckily we do not get and missing data or undefined values in this dataset. Here a beirf summary table of the data is generated.
+
+```{r}
+# problems(heart.data) %>% print()
+heart.data_tidied <- heart.data %>% mutate(diabetes = as.factor(Diabetes),
+                      family_history = as.factor(`Family History`),
+                      smoking = as.factor(Smoking),
+                      obesity = as.factor(Obesity),
+                      alcohol = as.factor(`Alcohol Consumption`),
+                      previous_problems = as.factor(`Previous Heart Problems`),
+                      medication = as.factor(`Medication Use`),
+                      heart_attack = as.factor(`Heart Attack Risk`),
+                      Sex = as.factor(Sex),
+                      Diet = as.factor(Diet),
+                      stress = as.factor(`Stress Level`),
+                      Country = as.factor(Country),
+                      Continent = as.factor(Continent),
+                      Hemisphere = as.factor(Hemisphere)) %>%
+                    select(-Diabetes, -`Family History`, -Smoking, -Obesity, -`Alcohol Consumption`, -`Previous Heart Problems`,-`Medication Use`, -`Heart Attack Risk`,-`Stress Level`)
+
+heart.data_tidied <- heart.data_tidied %>%
+  mutate(bld_pressure_split = strsplit(as.character(`Blood Pressure`), "/")) %>%
+  mutate(bld_pressure_upper = as.numeric(sapply(bld_pressure_split, `[`, 1)),
+         bld_pressure_lower = as.numeric(sapply(bld_pressure_split, `[`, 2))) %>%
+  select(-bld_pressure_split, -`Blood Pressure`) %>%
+  mutate(high_bld_pressure = as.factor(ifelse(bld_pressure_upper >=130 & bld_pressure_lower >=80,1,0)))
+
+print(summary(heart.data_tidied))
+```
+
+I am interested in the associations between covariates and heart attack risk, and after determining the covariates that contributes the most, I can fit a prediction model on heart attack risk.
+
+First, let's try to get a general sense on how these covariates associated with heart attack. For categorial variables, I used a histogram to show the heart attack frequencies in different groups. For continuous variables, I naively fitted a logistic regression without checking any assumptions.
+
+```{r}
+risky_data <- heart.data_tidied %>% filter(heart_attack == 1)
+
+# Reshape data for plotting
+risky_data_long <- risky_data %>%
+  pivot_longer(cols = c(Sex, Diet, diabetes, family_history, smoking, obesity, alcohol, previous_problems, medication, stress, high_bld_pressure), names_to = "variable", values_to = "value")
+
+# Plot a single histogram
+histogram.acoss_variable <- ggplot(risky_data_long, aes(x = value, fill = variable)) +
+  geom_bar(position = position_dodge(width = 0.9),width = 0.8) +
+  facet_wrap(~variable, scales = "free")+
+  labs(title = "Risky Frequencies by Sex, Continent, and Stress Level", x = "Categories", y = "Heart Attck Frequency") +
+  theme(
+    strip.text = element_text(size = 7, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1,size=6),  # Rotate x-axis labels
+    legend.position = "right"
+  )
+histogram.acoss_variable
+
+model <- glm(heart_attack ~ Age + Cholesterol + `Heart Rate` + `Exercise Hours Per Week` + 
+            `Sedentary Hours Per Day` + Income + BMI +
+              Triglycerides + `Sleep Hours Per Day`,
+              data = heart.data_tidied, family = binomial)
+              
+print(summary(model))
+
+```
+From the histogram and logistic model above, we can see that, not all variables are highly related to heart attack. To select the most relevant variables and prevent overfit of the final prediction model, here perform a PCA.
+
+```{r}
+heart.data_pca <- heart.data_tidied %>%
+                  mutate(sex = ifelse(Sex == "Male",1,0),
+                         diet = ifelse(Diet == "Unhealthy",1,0))
+pca.result <- prcomp(heart.data_pca %>% 
+                     select(-`Patient ID`, -heart_attack,-Continent,-Country,-Hemisphere, -Sex, -Diet) %>%
+                    mutate(across(everything(), as.numeric))%>%
+                    as.matrix(),
+                    scale. = T, center = T)
+
+pca.score <- as.data.frame(pca.result$x)
+
+explained_variance <- pca.result$sdev^2 / sum(pca.result$sdev^2)
+cumulative_variance <- cumsum(explained_variance)
+
+# Plot the scree plot
+
+plot(explained_variance, type = "b", col="blue",
+     xlab = "Principal Component",
+     ylab = "Proportion of Variance Explained",
+     ylim = c(0:1),
+     main = "Scree Plot with Culmulative Variance")
+lines(cumulative_variance, type = "b", pch = 19, col = "red")
+
+```
+
+Unfortunately, only around 20% variance is explained by PC1 and PC2, but we could still plot the PCA score of every observation and see if there is clustering. And we can decide which variables are "important" to predict heart attack risk by looking into the rotation coefficient. Let's draw the PCA plot first.
+
+```{r}
+plot1<-ggplot(data=pca.score %>%as.tibble() %>% select(PC1, PC2), aes(PC1,PC2)) +
+  geom_point(color = "navy")
+
+
+heart.data_kmeans <- heart.data_pca %>% 
+                     select(-`Patient ID`, -heart_attack,-Continent,-Country,-Hemisphere, -Sex, -Diet)%>%
+                      mutate(across(everything(), as.numeric))%>%
+                     scale(center = TRUE, scale = TRUE)
+pcd_kmeans<- pca.score %>% as.tibble() %>% mutate(lables=kmeans(heart.data_kmeans,centers=4)$cluster)%>%
+      select(PC1,PC2,lables)
+plot3<-ggplot(data=pcd_kmeans, aes(PC1,PC2)) +
+  geom_point(aes(colour = factor(lables)))+
+  labs(color = "Cluster by Kmeans")
+
+
+pcd_continent <- pca.score %>% as.tibble() %>% mutate(continent=heart.data_pca$Continent)%>%
+      select(PC1,PC2,continent)
+
+
+plot2<-ggplot(data=pcd_continent, aes(PC1,PC2)) +
+  geom_point(aes(colour = factor(continent)))+
+  labs(color = "Continent")+
+  theme(legend.position = "right", legend.box = "vertical",
+        axis.title = element_text(size = 9,vjust = 0), 
+        legend.text = element_text(size = 7),
+    legend.title = element_text(size = 9),
+    legend.key = element_rect(fill = NA))
+
+pcd_country <- pca.score %>% as.tibble() %>% mutate(country=heart.data_pca$Country)%>%
+      select(PC1,PC2,country)
+plot4<-ggplot(data=pcd_country, aes(PC1,PC2)) +
+  geom_point(aes(colour = factor(country)))+
+  labs(color = "Country")+
+  guides(colour = guide_legend(ncol  = 2))+
+  theme(legend.position = "right", legend.box = "vertical",
+        axis.title = element_text(size = 9,vjust = 0), 
+        legend.text = element_text(size = 7),
+    legend.title = element_text(size = 9),
+    legend.key = element_rect(fill = NA))
+# ggThemeAssistGadget(p)
+
+grid.arrange(plot1,plot3)
+grid.arrange(plot2, plot4)
+
+```
+
+The four figures are all scatter plots of observation after projecting onto PC1 and PC2. 
+
+The first one is purly plotting PCA result. We can see there are 4 clusters, which means individuals in same cluster could share similar characteristics.
+The second plot is same plot as the first one but colored by kmeans clustering. We can see that kmeans and PCA gave quite similar clustering, but seems like kmeans can give a finer clustering.It is not supurising considering PC1 and PC2 only explained 20% variance.
+
+The third one and fourth one are colored by continent and country. I just think it would be interesting to see if people live in same area will share some certain life habit or characteristics that would increase/reduce heart attack risk, but as we seen, individuals from different places are evenly distributed in the 4 clusters.
+
+
+
+```{r}
+pcd1 <- pca.score %>% as.tibble() %>% mutate(continent=heart.data_pca$Continent)%>%
+      select(PC1,PC2,PC3,continent)
+# Create a color palette
+colors <- rainbow(length(unique(pcd1$continent)))
+names(colors) <- unique(pcd1$continent)
+
+# Plot the 3D PCA
+library(plotly)
+
+plot_ly(pcd1, x = ~PC1, y = ~PC2, z = ~PC3, color = ~continent, colors = "Set1",
+        type = "scatter3d", mode = "markers") %>%
+  layout(scene = list(xaxis = list(title = 'Principal Component 1'),
+                      yaxis = list(title = 'Principal Component 2'),
+                      zaxis = list(title = 'Principal Component 3')))
+plot_ly
+
+```
+
+It is a 3-dimention PCA score plot colored by continent. I thought maybe one more component would make some difference, but sadly not. I kept it anyway, at lease it looks cool.
+
+
+Next, I want to fit a predication model. From what we got above, not all covariates need to be go into the model. So I select the variables by the absolute value of rotation coefficient.
+
+```{r}
+pca.rotation <- pca.result$rotation %>% as.data.frame() %>% mutate(covariates = rownames(.))
+
+rotation.pc1 <- pca.rotation[,1] %>% abs() %>% as.data.frame()%>% 
+                mutate(covariates = rownames(pca.rotation))%>%
+                arrange(desc(.))
+
+rotation.pc2 <- pca.rotation[,2] %>% abs() %>% as.data.frame()%>% 
+                mutate(covariates = rownames(pca.rotation))%>%
+                arrange(desc(.))
+head(rotation.pc1$covariates,10) %>% print
+head(rotation.pc2$covariates,10) %>% print
+
+
+```
+
+
+```{r}
+heart.data_model <- heart.data_pca %>% select("high_bld_pressure","smoking","Age","stress","obesity",
+                                            `Physical Activity Days Per Week`,`Sedentary Hours Per Day`,
+                                            "family_history","Cholesterol",Income)%>%
+                                        mutate(heart_attack = as.numeric(heart.data_pca$heart_attack)-1)%>%mutate(stress = as.numeric(heart.data_pca$stress))
+
+
+set.seed(611)
+train_ii <- runif(nrow(heart.data_model)) < 0.85
+train <- heart.data_model %>% filter(train_ii)
+test <- heart.data_model %>% filter(!train_ii)
+
+model <- glm(heart_attack ~ ., data = train,family = binomial)
+summary(model)
+prediction <- predict(model, newdata = test, type = "response")
+roc.result<-roc(test$heart_attack,prediction)
+plot(roc.result)
+
+
+```
+Randomly choose 85% observation as training set, the rest as testing set. Put the variables selected above into a logistic model. Perform prediction on test data and draw ROC plot. But sadly the model performs not good(ROC =0.5), basically equivalent to random guess. Even adding all available covariates into the model did not improve the performance. Maybe there are too many unobserved variates will effect heart attack risk or because it is artificial dataset?
+
+
+```{r}
+
+
+# Create a data frame for plotting
+plot_data <- test %>% mutate(predicted_risk = prediction)
+
+# Plot the logistic regression curve along with the observed data points
+p1 <- ggplot(plot_data, aes(x =Age, y = predicted_risk)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "black") +
+  labs(x = "Age",
+       y = "Heart Risk Probability") +
+  theme_minimal()
+
+p2<-ggplot(plot_data, aes(x =`Physical Activity Days Per Week`, y = predicted_risk)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "black") +
+  labs(x = "Physical Activity Days Per Week",
+       y = "Heart Risk Probability") +
+  theme_minimal()
+
+p3<- ggplot(plot_data, aes(x =`Sedentary Hours Per Day`, y = predicted_risk)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "black") +
+  labs(x = "Sedentary Hours Per Day",
+       y = "Heart Risk Probability") +
+  theme_minimal()
+
+p4<- ggplot(plot_data, aes(x = Income, y = predicted_risk)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "black") +
+  labs(x = "Income",
+       y = "Heart Risk Probability") +
+  theme_minimal()
+
+grid.arrange(p1,p2,p3,p4,ncol=2)
+```
+There are several association I want to investigate. So I use the prediction result on test data to plot the heart attack risk against some variates. From what I got here, heart attack risk goes up as people getting older, getting less exercise and having more sedentary hours. These align our common sense about heart attack. But what is out of expectation is that, this data indicating heart attack risk increase as income increase.
